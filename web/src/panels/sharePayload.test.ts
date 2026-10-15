@@ -8,6 +8,7 @@
  * non-nullable parameters.
  */
 import { describe, expect, it } from 'vitest';
+import { decodeSharePayload, encodeSharePayload, roundTo } from '../lib/shareCodec';
 import { pairSharePayload } from './sharePayload';
 import type { PairEstimate, PairLegDetail } from './assets/assetModel';
 
@@ -34,6 +35,7 @@ const yuLeg = (over: Partial<PairLegDetail> = {}): PairLegDetail => ({
 const pair = (over: Partial<PairEstimate> = {}): PairEstimate => ({
   longVenue: 'gate',
   shortVenue: 'hyperliquid',
+  kind: 'singles',
   size: 0.01,
   unit: 'base',
   notionalUsd: 98,
@@ -103,9 +105,10 @@ describe('pairSharePayload', () => {
   it('omits a YU leg rate rather than publishing it as 0%', () => {
     const withUnknownRate = pair({ legs: [yuLeg({ lockedApr: null }), ...pair().legs.slice(1)] });
     const p = pairSharePayload(withUnknownRate, 'ETH', opts);
-    // Legs are re-sorted for display, so find the one by identity, not index.
-    const gateYu = p.l.find((l) => l.k === 'b' && l.x === 'gate' && l.s === 'L');
-    expect(gateYu?.r).toBeUndefined();
+    // The two Boros legs share one row, so one unknown rate leaves it blank.
+    const boros = p.l.filter((l) => l.k === 'b');
+    expect(boros).toHaveLength(1);
+    expect(boros[0].r).toBeUndefined();
     expect(p.l.every((l) => l.r !== 0)).toBe(true);
   });
 
@@ -117,5 +120,107 @@ describe('pairSharePayload', () => {
     const p = pairSharePayload(pair(), 'ETH', opts);
     expect(JSON.stringify(p)).not.toMatch(/0x[0-9a-fA-F]{8}/);
     expect(p.b).toBe('ETH');
+  });
+});
+
+describe('pairSharePayload on a spread pair', () => {
+  const OPENED = Date.UTC(2026, 9, 8) / 1000;
+  const NOV_27 = Date.UTC(2026, 10, 27) / 1000;
+  const perp = (venue: string, side: 'LONG' | 'SHORT', symbol: string): PairLegDetail => ({
+    ...yuLeg({ venue, side, sizeToken: 0.555, sizeBase: 0.555, notionalUsd: 1_700, lockedApr: null }),
+    kind: 'perp',
+    symbol,
+    marketId: undefined,
+  });
+  const ownerPair = (): PairEstimate => ({
+    ...pair({ longVenue: 'GATE', shortVenue: 'HYPERLIQUID', soonestMaturitySec: NOV_27, hedgedSinceSec: OPENED }),
+    legs: [
+      perp('GATE', 'LONG', 'GATE_FUTURE_ETH_USDT'),
+      perp('HYPERLIQUID', 'SHORT', 'HYPERLIQUID_FUTURE_ETH_USDC'),
+      {
+        ...yuLeg({
+          venue: 'HYPERLIQUID',
+          side: 'SHORT',
+          sizeToken: 0.555,
+          sizeBase: 0.555,
+          notionalUsd: 1_700,
+          lockedApr: 0.0348,
+          marketId: 59,
+          maturity: NOV_27,
+        }),
+        spreadVenues: ['HYPERLIQUID', 'GATE'],
+      },
+    ],
+  });
+
+  it('spread leg', () => {
+    const payload = pairSharePayload(ownerPair(), 'ETH', { ...opts, nowSec: OPENED });
+    const boros = payload.l.filter((l) => l.k === 'b');
+    expect(boros).toHaveLength(1);
+    expect(boros[0]).toMatchObject({ k: 'b', x: 'HYPERLIQUID_GATE', s: 'S', n: 1_700 });
+    // The row carries the pair's net locked spread, the figure the card prints beside it.
+    expect(boros[0].r).toBeCloseTo(payload.sp, 12);
+    expect(payload.v).toBe(1);
+    const decoded = decodeSharePayload(encodeSharePayload(payload));
+    expect(decoded).toEqual({
+      ok: true,
+      payload: {
+        ...payload,
+        sp: roundTo(payload.sp, 4),
+        p: Math.round(payload.p),
+        l: payload.l.map((l) => (l.r === undefined ? l : { ...l, r: roundTo(l.r, 4) })),
+      },
+    });
+  });
+
+  it('shows two single Boros legs as one HL-GATE spread leg', () => {
+    const payload = pairSharePayload(pair(), 'ETH', opts);
+    const boros = payload.l.filter((l) => l.k === 'b');
+    expect(boros).toHaveLength(1);
+    // Hyperliquid's single is SHORT, so the HL−Gate spread is short.
+    expect(boros[0]).toMatchObject({ x: 'HYPERLIQUID_GATE', s: 'S', n: 0 });
+    expect(boros[0].r).toBeCloseTo(payload.sp, 12);
+    expect(payload.l.filter((l) => l.k === 'p')).toHaveLength(2);
+  });
+
+  it('sizes a mixed book per perp side: a spread counts whole, a single half', () => {
+    const singles = (n: number) => [
+      yuLeg({ venue: 'GATE', side: 'LONG', notionalUsd: n, sizeBase: n / 3000 }),
+      yuLeg({ venue: 'HYPERLIQUID', side: 'SHORT', notionalUsd: n, sizeBase: n / 3000, lockedApr: 0.08 }),
+    ];
+    const mixed = ownerPair();
+    mixed.legs = [...mixed.legs, ...singles(1_000)];
+    const payload = pairSharePayload(mixed, 'ETH', { ...opts, nowSec: OPENED });
+    const boros = payload.l.filter((l) => l.k === 'b');
+    expect(boros).toHaveLength(1);
+    expect(boros[0]).toMatchObject({ x: 'HYPERLIQUID_GATE', s: 'S', n: 2_700 });
+    expect(boros[0].tn).toBeCloseTo(0.555 + 1_000 / 3000, 3);
+    expect(boros[0].r).toBeCloseTo(payload.sp, 12);
+  });
+
+  it('names a spread for any venue pair, Hyperliquid first, else A to Z', () => {
+    const okxLighter = pair({
+      legs: [
+        yuLeg({ venue: 'OKX', side: 'SHORT', notionalUsd: 1_000, lockedApr: 0.06 }),
+        yuLeg({ venue: 'LIGHTER', side: 'LONG', notionalUsd: 1_000, lockedApr: -0.04 }),
+      ],
+    });
+    const payload = pairSharePayload(okxLighter, 'ETH', opts);
+    const boros = payload.l.filter((l) => l.k === 'b');
+    // LIGHTER first; its single is LONG, so the LIGHTER−OKX spread is long.
+    expect(boros).toEqual([expect.objectContaining({ x: 'LIGHTER_OKX', s: 'L', n: 1_000 })]);
+    // `r` is the entry rate a LONG pays: −spread, so the page reads "receive".
+    expect(payload.sp).toBeGreaterThan(0);
+    expect(boros[0].r).toBeCloseTo(-payload.sp, 12);
+  });
+
+  it('keeps the legs apart when they do not form one spread', () => {
+    const threeVenues = pair({
+      legs: [yuLeg({ venue: 'GATE' }), yuLeg({ venue: 'OKX', side: 'SHORT' }), yuLeg({ venue: 'LIGHTER', side: 'SHORT' })],
+    });
+    const boros = pairSharePayload(threeVenues, 'ETH', opts).l.filter((l) => l.k === 'b');
+    expect(boros).toHaveLength(3);
+    // A LONG single held at 5.04% sends its entry rate, +5.04%: the page reads "pay".
+    expect(boros.find((l) => l.s === 'L')?.r).toBe(0.0504);
   });
 });

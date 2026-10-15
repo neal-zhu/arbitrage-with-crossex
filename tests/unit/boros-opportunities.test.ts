@@ -12,6 +12,8 @@ import type { BorosMarket, BorosOrderBook } from '../../src/core/boros/client';
 import {
   borosAprFloor,
   borosInitialMarginUsd,
+  borosLiquidationApr,
+  borosLiquidationRate,
   buildOpportunities,
   groupBorosMarkets,
   normalizeUnderlying,
@@ -42,6 +44,7 @@ const BN_SYMBOL = 'BINANCE_FUTURE_ETH_USDT';
 
 const hlMarket: BorosMarket = {
   maxRateDeviationApr: 0.016,
+  spreadVenues: null,
   marketId: 155,
   tokenId: 3,
   name: 'Hyperliquid ETH 31 Aug 2026',
@@ -243,9 +246,9 @@ describe('buildOpportunities — canonical pair (both-market entry, close at mat
     expect(group.secondsToMaturity).toBe(30 * DAY);
     expect(group.pairs).toHaveLength(1);
     const pair = group.bestPair!;
-    expect(pair.shortLeg.marketId).toBe(155);
+    expect(pair.borosLegs[0].marketId).toBe(155);
     expect(pair.shortLeg.crossexSymbol).toBe(HL_SYMBOL);
-    expect(pair.longLeg.marketId).toBe(101);
+    expect(pair.borosLegs[1].marketId).toBe(101);
     expect(pair.longLeg.crossexSymbol).toBe(BN_SYMBOL);
     expect(pair.base).toBe('ETH');
   });
@@ -253,8 +256,8 @@ describe('buildOpportunities — canonical pair (both-market entry, close at mat
   it('locks the bid of A against the ask of B, and reports the book impact', () => {
     const pair = result().groups[0].bestPair!;
     // SHORT fixed sells into A's bids (8.99%); LONG fixed lifts B's asks (4.51%).
-    expect(pair.shortLeg.execApr).toBeCloseTo(0.0899, 10);
-    expect(pair.longLeg.execApr).toBeCloseTo(0.0451, 10);
+    expect(pair.borosLegs[0].execApr).toBeCloseTo(0.0899, 10);
+    expect(pair.borosLegs[1].execApr).toBeCloseTo(0.0451, 10);
     expect(pair.grossSpreadApr).toBeCloseTo(0.09 - 0.045, 10);
     expect(pair.execSpreadApr).toBeCloseTo(0.0899 - 0.0451, 10);
     expect(pair.borosImpactApr).toBeCloseTo(0.045 - (0.0899 - 0.0451), 10);
@@ -367,6 +370,69 @@ describe('borosInitialMarginUsd', () => {
   });
 });
 
+describe('borosLiquidationRate', () => {
+  // Live prod positions on 2026-10-14, with the liquidationApr the venue's
+  // Explorer.calcLiquidationRate reported for each. availValue is the
+  // account's value less this position's value and MM, from
+  // /v1/accounts/market-acc-infos-by-root; t is data.timeToMaturity.
+  const floorAt = (iTickThresh: number, tickStep: number) => 1.00005 ** (iTickThresh * tickStep) - 1;
+  const t = 1_353_600 / SECONDS_IN_YEAR;
+  it.each([
+    // [market, size, availValue, kMM, floor, tThresh (s), venue liquidationApr]
+    ['216 HYPE short, mark above the floor', -200, 42.302315700960776, 2 / 3, floorAt(1134, 2), 432_000, 2.956661852716088],
+    ['217 HYPE long, mark below minus the floor', 200, 41.13959774416658, 2 / 3, floorAt(1134, 2), 432_000, -2.875395289140153],
+    ['201 BTC long, mark inside the floor', 13.90022719314599, 0.05915736747162836, 4 / 9, floorAt(770, 2), 432_000, -0.06357906125467241],
+    ['203 BTC short, 10-day tThresh', -24.87988, 0.16664755315819701, 4 / 9, floorAt(583, 2), 864_000, 0.10803539855657097],
+  ])('matches the venue on %s', (_label, size, avail, kMM, floor, tThreshSec, venue) => {
+    const got = borosLiquidationRate(size, avail, kMM, floor, t, tThreshSec / SECONDS_IN_YEAR);
+    expect(got).toBeCloseTo(venue, 9);
+  });
+});
+
+describe('borosLiquidationApr', () => {
+  const { kIM, kMM } = imInputs;
+
+  it('solves a short above the floor with MM growing with the mark', () => {
+    // Liquidated where cash 0.09 × (kIM + 1) × t equals MM kMM × mark × t
+    // less the position value −mark × t. The old closed form gave 10.29%.
+    expect(borosLiquidationApr(hlMarket, 0.09, 'short', NOW)).toBeCloseTo((0.09 * (1 + kIM)) / (1 + kMM), 12);
+  });
+
+  it('solves a short that opens inside the floor and liquidates above it', () => {
+    // Margin is charged at the floor; at liquidation the mark is past it, so
+    // MM uses the mark. The old closed form kept MM at the floor: 8.143%.
+    const liq = borosLiquidationApr(hlMarket, 0.07, 'short', NOW)!;
+    expect(liq).toBeCloseTo((FLOOR * kIM + 0.07) / (1 + kMM), 12);
+    expect(liq).toBeGreaterThan(FLOOR);
+  });
+
+  it('keeps MM at the floor when the mark stays inside it', () => {
+    // Long at 4.2%: liq = 4.2% − floor × (kIM − kMM), same as before.
+    expect(borosLiquidationApr(hlMarket, 0.042, 'long', NOW)).toBeCloseTo(0.042 - FLOOR * (kIM - kMM), 12);
+  });
+
+  it('mirrors a long on a negative rate', () => {
+    expect(borosLiquidationApr(hlMarket, -0.09, 'long', NOW)).toBeCloseTo((-0.09 * (1 + kIM)) / (1 + kMM), 12);
+  });
+
+  it('uses tThresh for the margin time near maturity', () => {
+    // 1 day left, 5-day tThresh: margin and MM use 5 days, the value 1 day.
+    const near = { ...hlMarket, maturity: NOW + DAY };
+    expect(borosLiquidationApr(near, 0.09, 'short', NOW)).toBeCloseTo((0.09 * kIM * 5 + 0.09) / (1 + kMM * 5), 12);
+  });
+
+  it('is null past max(250%, 10 × |mark|), where the Boros app shows N/A', () => {
+    const liq = (2.4 * (1 + kIM)) / (1 + kMM); // ≈ 266%
+    expect(borosLiquidationApr({ ...hlMarket, markApr: 0.089 }, 2.4, 'short', NOW)).toBeNull();
+    expect(borosLiquidationApr({ ...hlMarket, markApr: 0.3 }, 2.4, 'short', NOW)).toBeCloseTo(liq, 12);
+  });
+
+  it('is null on a matured market or without kMM', () => {
+    expect(borosLiquidationApr({ ...hlMarket, maturity: NOW }, 0.09, 'short', NOW)).toBeNull();
+    expect(borosLiquidationApr({ ...hlMarket, kMM: 0 }, 0.09, 'short', NOW)).toBeNull();
+  });
+});
+
 describe('perpInitialMarginUsd', () => {
   it('sizes the leg at the venue max leverage', () => {
     expect(perpInitialMarginUsd(1_000_000, 10)).toBeCloseTo(100_000, 6);
@@ -391,8 +457,8 @@ describe('buildOpportunities — capital and the APR on capital', () => {
 
   it('models each leg margin and sums them into capital', () => {
     const pair = buildOpportunities(input(), opts()).groups[0].bestPair!;
-    expect(pair.capital.borosShortImUsd).toBeCloseTo(borosShort, 6);
-    expect(pair.capital.borosLongImUsd).toBeCloseTo(borosLong, 6);
+    expect(pair.capital.borosIms[0].imUsd).toBeCloseTo(borosShort, 6);
+    expect(pair.capital.borosIms[1].imUsd).toBeCloseTo(borosLong, 6);
     expect(pair.capital.perpShortImUsd).toBeCloseTo(100_000, 6);
     expect(pair.capital.perpLongImUsd).toBeCloseTo(50_000, 6);
     expect(pair.capital.shortLeverageMax).toBe(HL_LEVERAGE);
@@ -451,8 +517,8 @@ describe('buildOpportunities — capital and the APR on capital', () => {
       opts(),
     );
     const pair = out.groups[0].pairs[0];
-    expect(pair.capital.borosShortImUsd).toBeCloseTo(borosShort, 6);
-    expect(pair.capital.borosLongImUsd).toBeNull();
+    expect(pair.capital.borosIms[0].imUsd).toBeCloseTo(borosShort, 6);
+    expect(pair.capital.borosIms[1].imUsd).toBeNull();
     expect(pair.capitalUsd).toBeNull();
     expect(pair.netFixedAprOnCapital).toBeNull();
     expect(pair.reasons.join(' ')).toMatch(
@@ -518,8 +584,8 @@ describe('buildOpportunities — borosEntry: mark', () => {
     const group = out.groups[0];
     expect(group.markets.map((m) => m.bookStatus)).toEqual(['not-fetched', 'not-fetched']);
     const pair = group.bestPair!;
-    expect(pair.shortLeg.execApr).toBeCloseTo(0.089, 10);
-    expect(pair.longLeg.execApr).toBeCloseTo(0.046, 10);
+    expect(pair.borosLegs[0].execApr).toBeCloseTo(0.089, 10);
+    expect(pair.borosLegs[1].execApr).toBeCloseTo(0.046, 10);
     expect(pair.execSpreadApr).toBeCloseTo(0.089 - 0.046, 10);
     expect(pair.borosImpactApr).toBeCloseTo(0.045 - (0.089 - 0.046), 10);
     expect(pair.netFixedApr).not.toBeNull();
@@ -541,8 +607,8 @@ describe('buildOpportunities — borosEntry: mark', () => {
 
     expect(group.pairs).toHaveLength(1);
     const pair = group.pairs[0];
-    expect(pair.shortLeg.marketId).toBe(101);
-    expect(pair.longLeg.marketId).toBe(155);
+    expect(pair.borosLegs[0].marketId).toBe(101);
+    expect(pair.borosLegs[1].marketId).toBe(155);
     expect(pair.execSpreadApr).toBeCloseTo(0.0009, 10);
     expect(pair.grossSpreadApr).toBeCloseTo(0.045 - 0.0453, 10);
   });
@@ -625,7 +691,7 @@ describe('buildOpportunities — degraded modes', () => {
     expect(group.markets.find((m) => m.marketId === 101)!.bookStatus).toBe('insufficient-depth');
     expect(group.markets.find((m) => m.marketId === 101)!.execLongApr).toBeCloseTo(0.0451, 10);
     const pair = group.pairs[0];
-    expect(pair.longLeg.execApr).toBeCloseTo(0.0451, 10);
+    expect(pair.borosLegs[1].execApr).toBeCloseTo(0.0451, 10);
     expect(pair.execSpreadApr).toBeNull();
     expect(pair.borosImpactApr).toBeNull();
     expect(pair.netFixedApr).toBeNull();
@@ -725,7 +791,7 @@ describe('buildOpportunities — degraded modes', () => {
       }),
       opts(),
     );
-    const pair = built.groups[0].pairs.find((p) => p.longLeg.marketId === 187)!;
+    const pair = built.groups[0].pairs.find((p) => p.borosLegs[1].marketId === 187)!;
     expect(pair.longLeg.crossexVenue).toBe('LIGHTER');
     expect(pair.longLeg.crossexSymbol).toBe(LT_SYMBOL);
     expect(pair.netFixedApr).not.toBeNull();
@@ -767,7 +833,7 @@ describe('buildOpportunities — degraded modes', () => {
     expect(lighter.crossexVenue).toBe('LIGHTER');
     expect(lighter.crossexSymbol).toBe(LT_SYMBOL);
     expect(group.pairs).toHaveLength(3);
-    const ltPair = group.pairs.find((p) => p.shortLeg.marketId === 155 && p.longLeg.marketId === 187)!;
+    const ltPair = group.pairs.find((p) => p.borosLegs[0].marketId === 155 && p.borosLegs[1].marketId === 187)!;
     expect(ltPair.longLeg.crossexVenue).toBe('LIGHTER');
     expect(ltPair.costs.perpEntryFeesUsd).toBeCloseTo(2 * N * 0.0005, 8);
     expect(ltPair.netFixedApr).not.toBeNull();
@@ -907,8 +973,8 @@ describe('buildOpportunities — ranking', () => {
     );
     const pairs = out.groups[0].pairs;
     expect(pairs[0].netFixedApr).not.toBeNull();
-    expect(pairs[0].shortLeg.marketId).toBe(155);
-    expect(pairs[0].longLeg.marketId).toBe(101);
+    expect(pairs[0].borosLegs[0].marketId).toBe(155);
+    expect(pairs[0].borosLegs[1].marketId).toBe(101);
     expect(pairs.slice(1).every((p) => p.netFixedApr === null)).toBe(true);
     // Nulls are ordered among themselves by exec spread, then gross spread.
     expect(pairs[1].grossSpreadApr).toBeGreaterThanOrEqual(pairs[2].grossSpreadApr);
@@ -954,11 +1020,11 @@ describe('buildOpportunities — ranking keys on the capital basis', () => {
 
   it('sinks an unpriceable-capital pair below a priced one that earns less on notional', () => {
     const pairs = buildOpportunities(withOkx(), opts()).groups[0].pairs;
-    expect(pairs[0].shortLeg.marketId).toBe(155);
-    expect(pairs[0].longLeg.marketId).toBe(101);
+    expect(pairs[0].borosLegs[0].marketId).toBe(155);
+    expect(pairs[0].borosLegs[1].marketId).toBe(101);
     expect(pairs[0].netFixedAprOnCapital).not.toBeNull();
     // The pair it beat locks 8.99% − 2.01% on notional versus 8.99% − 4.51%.
-    expect(pairs[1].longLeg.marketId).toBe(158);
+    expect(pairs[1].borosLegs[1].marketId).toBe(158);
     expect(pairs[1].netFixedAprOnCapital).toBeNull();
     expect(pairs[1].netFixedApr).toBeGreaterThan(pairs[0].netFixedApr!);
     expect(pairs.slice(1).every((p) => p.capitalUsd === null)).toBe(true);

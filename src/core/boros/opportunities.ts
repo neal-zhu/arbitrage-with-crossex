@@ -38,6 +38,8 @@ import { walkBook } from '../estimate/fill';
 import { borosRateBand, rateInsideBand } from './rateBounds';
 import { resolveFeeRates, resolveVenueFeeRates, type VenueFeeRow } from '../estimate/fees';
 import { BOROS_TOKEN_SYMBOLS, type BorosMarket, type BorosOrderBook } from './client';
+import { prettyVenue } from '../../../web/src/lib/fmt';
+import { isSpreadMarket, type SpreadSide } from './spread';
 import { normalizeVenue, SECONDS_IN_YEAR } from './venue';
 
 /** Fungible tickers that must land in ONE group (mirrors boros-tools'
@@ -110,26 +112,28 @@ export interface OpportunityCostBreakdown {
 }
 
 export interface OpportunityLeg {
-  marketId: number;
   /** Boros platformId, display-cased. */
   venue: string;
   crossexVenue: string;
   crossexSymbol: string;
   base: string;
+}
+
+export interface OpportunityBorosLeg {
+  marketId: number;
+  side: SpreadSide;
+  venue: string;
+  spreadVenues: [string, string] | null;
   midApr: number;
-  /** The rate this leg actually locks (receive-fixed on the short, pay-fixed on
-   * the long); null when the book can't support the size. */
   execApr: number | null;
-  /** This market's settlement-fee APR (a cost to either side). Exposed per leg
-   * so the rebate overlay can discount it per market. */
   settleFeeApr: number;
+  takerFeeRate: number;
 }
 
 /** The modelled minimum capital a pair consumes, leg by leg. Each component is
  * null when an input it needs is missing, and any null nulls `capitalUsd`. */
 export interface OpportunityCapitalBreakdown {
-  borosShortImUsd: number | null;
-  borosLongImUsd: number | null;
+  borosIms: { marketId: number; imUsd: number | null }[];
   perpShortImUsd: number | null;
   perpLongImUsd: number | null;
   /** Max leverage used to size the perp leg's margin; null when unknown. */
@@ -145,6 +149,7 @@ export interface OpportunityPair {
   shortLeg: OpportunityLeg;
   /** Market B: Boros LONG fixed + perp LONG. */
   longLeg: OpportunityLeg;
+  borosLegs: OpportunityBorosLeg[];
   /** midApr_A − midApr_B — the headline spread, before any execution cost. */
   grossSpreadApr: number;
   /** execApr_A − execApr_B — what the size actually locks. */
@@ -207,6 +212,7 @@ export interface MarketGroupPlan {
   underlying: string;
   /** Members, midApr descending. */
   markets: BorosMarket[];
+  spreads: BorosMarket[];
 }
 
 export interface BuildOpportunitiesInput {
@@ -318,24 +324,59 @@ export function borosInitialMarginUsd(
 }
 
 /**
- * The mark rate at which a Boros position backed by EXACTLY its initial
- * margin is liquidated.
+ * The mark rate at which a Boros position liquidates: the 3-case solve of
+ * `Explorer.calcLiquidationRate` (pendle-core-v3), which the venue reports for
+ * held positions and the backend runs on its order simulation. All inputs are
+ * per unit and in years: `size` is signed (long > 0), `availValue` is the
+ * account's value without this position's value and MM, `t` the time to
+ * maturity, `tThresh` the market's time floor, `floor` its rate floor.
  *
- * A fixed-rate position's mark-to-market is linear in the rate move —
- * ΔPnL ≈ −Δrate × N × DTM/365 for a short (receive fixed), the mirror for a
- * long — and the IM and MM formulas are the same expression scaled by kIM and
- * kMM. So the loss that eats the equity down to maintenance is
- * N × max(|apr|, floor) × max(DTM, tThresh)/365 × (kIM − kMM), and the rate
- * move that produces it is
- *   Δ = max(|apr|, floor) × max(DTM, tThresh)/DTM × (kIM − kMM).
- * A short (receives fixed) loses when the rate RISES: liq = apr + Δ. A long
- * loses when it falls: liq = apr − Δ. Discounting is ignored, as it is in the
- * IM formula itself.
+ * MM = |size| × max(|mark|, floor) × kMM × max(t, tThresh). Equity is
+ * availValue + size × mark × t, so each case solves equity = MM for one shape
+ * of MM: mark inside the floor, above it, below its negative. Null when no
+ * case holds (the contract's 0). Checked against 106 live positions'
+ * liquidationApr on 2026-10-14: all equal.
+ */
+export function borosLiquidationRate(
+  size: number,
+  availValue: number,
+  kMM: number,
+  floor: number,
+  t: number,
+  tThresh: number,
+): number | null {
+  const sizeT = size * t;
+  const mm = Math.abs(size) * kMM * Math.max(t, tThresh);
+  // Near maturity the contract charges a different MM to a position whose
+  // mark rate has the same sign as its size; the solve does not cover it.
+  const switched = (rate: number) => t < tThresh * kMM && size * rate > 0;
+  if (sizeT !== 0) {
+    const rate = (mm * floor - availValue) / sizeT;
+    if (Math.abs(rate) <= floor) return rate;
+  }
+  if (sizeT - mm !== 0) {
+    const rate = -availValue / (sizeT - mm);
+    if (rate > floor && !switched(rate)) return rate;
+  }
+  if (sizeT + mm !== 0) {
+    const rate = -availValue / (sizeT + mm);
+    if (rate < -floor && !switched(rate)) return rate;
+  }
+  return null;
+}
+
+/**
+ * The mark rate at which a Boros position backed by EXACTLY its initial
+ * margin is liquidated, solved as the contract does (borosLiquidationRate).
+ * After the fill the account holds the initial margin less the upfront fixed
+ * cost, size × execApr × t, and nothing else.
  *
  * This is the FLOOR of the distance, not the account's actual one: cross
  * collateral beyond the IM, or a fatter isolated bucket, moves it further
- * out. Null when either coefficient is missing, kMM is not below kIM, or the
- * market has matured.
+ * out. Null when either coefficient is missing, kMM is not below kIM, the
+ * market has matured, or the contract finds no rate. Also null past
+ * max(250%, 10 × |mark|), where the Boros app shows "N/A" (dapp-nitro
+ * isLiquidationAprOutOfRange).
  */
 export function borosLiquidationApr(
   m: BorosMarket,
@@ -348,10 +389,14 @@ export function borosLiquidationApr(
   if (!Number.isFinite(execApr)) return null;
   const dtmDays = (m.maturity - nowSec) / DAY_SECONDS;
   if (!(dtmDays > 0)) return null;
-  const tThreshDays = (Number.isFinite(m.tThreshSec) ? m.tThreshSec : 0) / DAY_SECONDS;
-  const rate = Math.max(Math.abs(execApr), borosAprFloor(m));
-  const move = (rate * Math.max(dtmDays, tThreshDays) * (m.kIM - m.kMM)) / dtmDays;
-  return side === 'short' ? execApr + move : execApr - move;
+  const t = dtmDays / DAYS_IN_YEAR;
+  const tThresh = (Number.isFinite(m.tThreshSec) ? m.tThreshSec : 0) / DAY_SECONDS / DAYS_IN_YEAR;
+  const floor = borosAprFloor(m);
+  const size = side === 'long' ? 1 : -1;
+  const cash = Math.max(Math.abs(execApr), floor) * m.kIM * Math.max(t, tThresh) - size * execApr * t;
+  const liq = borosLiquidationRate(size, cash, m.kMM, floor, t, tThresh);
+  if (liq === null || Math.abs(liq) > Math.max(2.5, 10 * Math.abs(m.markApr))) return null;
+  return liq;
 }
 
 /**
@@ -390,7 +435,8 @@ export function perpInitialMarginUsd(
 export function groupBorosMarkets(markets: BorosMarket[], nowSec: number): MarketGroupPlan[] {
   const groups = new Map<string, MarketGroupPlan>();
   for (const m of markets) {
-    if (m.state !== 'Normal' || m.maturity <= nowSec) continue;
+    const isSpread = isSpreadMarket(m);
+    if (m.maturity <= nowSec || (!isSpread && m.state !== 'Normal')) continue;
     const underlying = normalizeUnderlying(m.base);
     const key = `${m.tokenId}:${m.maturity}:${underlying}`;
     const group = groups.get(key) ?? {
@@ -400,13 +446,14 @@ export function groupBorosMarkets(markets: BorosMarket[], nowSec: number): Marke
       maturity: m.maturity,
       underlying,
       markets: [],
+      spreads: [],
     };
-    group.markets.push(m);
+    (isSpread ? group.spreads : group.markets).push(m);
     groups.set(key, group);
   }
   const out: MarketGroupPlan[] = [];
   for (const group of groups.values()) {
-    if (group.markets.length < 2) continue;
+    if (group.markets.length < 2 && !group.spreads.some((m) => m.state === 'Normal')) continue;
     group.markets.sort((a, b) => b.midApr - a.midApr);
     out.push(group);
   }
@@ -653,17 +700,45 @@ interface GroupContext {
   collateralPriceUsd: number | null;
 }
 
-function toLeg(build: MarketRowBuild, side: 'short' | 'long'): OpportunityLeg {
-  const exec = side === 'short' ? build.short : build.long;
+function toLeg(build: MarketRowBuild): OpportunityLeg {
   return {
-    marketId: build.row.marketId,
     venue: build.row.venue,
     crossexVenue: build.row.crossexVenue as string,
     crossexSymbol: build.row.crossexSymbol as string,
     base: build.row.base,
+  };
+}
+
+function spreadPerpLeg(venue: string, build: MarketRowBuild, input: BuildOpportunitiesInput): OpportunityLeg {
+  return {
+    venue: prettyVenue(venue),
+    crossexVenue: venue,
+    crossexSymbol: (input.symbolsByVenueBase.get(`${venue}:${build.row.base}`) ?? null) as string,
+    base: build.row.base,
+  };
+}
+
+interface BorosLegBuild {
+  build: MarketRowBuild;
+  side: SpreadSide;
+}
+
+const borosTakerRate = (m: BorosMarket, takerFeeOverride: number | undefined): number =>
+  takerFeeOverride !== undefined && takerFeeOverride >= 0 ? takerFeeOverride : m.takerFeeRate;
+
+const signedApr = (side: SpreadSide, apr: number): number => (side === 'SHORT' ? apr : -apr);
+
+function toBorosLeg({ build, side }: BorosLegBuild, takerFeeOverride: number | undefined): OpportunityBorosLeg {
+  const exec = side === 'SHORT' ? build.short : build.long;
+  return {
+    marketId: build.row.marketId,
+    side,
+    venue: build.row.venue,
+    spreadVenues: build.market.spreadVenues,
     midApr: build.row.midApr,
     execApr: exec ? exec.apr : null,
     settleFeeApr: build.market.settleFeeApr,
+    takerFeeRate: borosTakerRate(build.market, takerFeeOverride),
   };
 }
 
@@ -689,24 +764,30 @@ function depthReason(
 
 function buildPair(
   ctx: GroupContext,
-  a: MarketRowBuild,
-  b: MarketRowBuild,
+  shortLeg: OpportunityLeg,
+  longLeg: OpportunityLeg,
+  boros: BorosLegBuild[],
   input: BuildOpportunitiesInput,
   options: BuildOpportunitiesOptions,
 ): OpportunityPair {
   const { notionalUsd, entryMode, exitMode, takerFeeOverride } = options;
   const reasons: string[] = [];
-  const shortLeg = toLeg(a, 'short');
-  const longLeg = toLeg(b, 'long');
+  const borosLegs = boros.map((leg) => toBorosLeg(leg, takerFeeOverride));
 
   // --- Boros side ----------------------------------------------------------
-  const grossSpreadApr = a.row.midApr - b.row.midApr;
-  const shortDepth = depthReason(a, a.short, 'receive-fixed', ctx, notionalUsd);
-  const longDepth = depthReason(b, b.long, 'pay-fixed', ctx, notionalUsd);
-  if (shortDepth) reasons.push(shortDepth);
-  if (longDepth) reasons.push(longDepth);
-  const lockable = a.short && b.long && !a.short.insufficient && !b.long.insufficient;
-  const execSpreadApr = lockable ? a.short!.apr - b.long!.apr : null;
+  const grossSpreadApr = borosLegs.reduce((sum, leg) => sum + signedApr(leg.side, leg.midApr), 0);
+  let lockable = true;
+  for (const { build, side } of boros) {
+    const exec = side === 'SHORT' ? build.short : build.long;
+    const depth = depthReason(build, exec, side === 'SHORT' ? 'receive-fixed' : 'pay-fixed', ctx, notionalUsd);
+    if (depth) {
+      reasons.push(depth);
+      lockable = false;
+    }
+  }
+  const execSpreadApr = lockable
+    ? borosLegs.reduce((sum, leg) => sum + signedApr(leg.side, leg.execApr as number), 0)
+    : null;
   const borosImpactApr = execSpreadApr === null ? null : grossSpreadApr - execSpreadApr;
 
   // --- Perp legs -----------------------------------------------------------
@@ -732,11 +813,8 @@ function buildPair(
 
   // --- Costs ---------------------------------------------------------------
   const notionalYears = notionalUsd * ctx.yearsToMaturity;
-  const borosTakerRate = (m: BorosMarket): number =>
-    takerFeeOverride !== undefined && takerFeeOverride >= 0 ? takerFeeOverride : m.takerFeeRate;
-  const borosTakerFeeUsd =
-    (borosTakerRate(a.market) + borosTakerRate(b.market)) * notionalYears;
-  const borosSettleFeeUsd = (a.market.settleFeeApr + b.market.settleFeeApr) * notionalYears;
+  const borosTakerFeeUsd = borosLegs.reduce((sum, leg) => sum + leg.takerFeeRate, 0) * notionalYears;
+  const borosSettleFeeUsd = borosLegs.reduce((sum, leg) => sum + leg.settleFeeApr, 0) * notionalYears;
   const perpParts = [entry.feesUsd, entry.slippageUsd, exit.feesUsd, exit.slippageUsd];
   const totalUsd = perpParts.some((p) => p === null)
     ? null
@@ -786,16 +864,17 @@ function buildPair(
   const shortLeverageMax = leverageMaxOf(shortLeg);
   const longLeverageMax = leverageMaxOf(longLeg);
   const capital: OpportunityCapitalBreakdown = {
-    borosShortImUsd: borosIm(a, shortLeg.execApr),
-    borosLongImUsd: borosIm(b, longLeg.execApr),
+    borosIms: boros.map(({ build }, i) => ({
+      marketId: build.row.marketId,
+      imUsd: borosIm(build, borosLegs[i].execApr),
+    })),
     perpShortImUsd: perpInitialMarginUsd(notionalUsd, shortLeverageMax),
     perpLongImUsd: perpInitialMarginUsd(notionalUsd, longLeverageMax),
     shortLeverageMax,
     longLeverageMax,
   };
   const capitalParts = [
-    capital.borosShortImUsd,
-    capital.borosLongImUsd,
+    ...capital.borosIms.map((leg) => leg.imUsd),
     capital.perpShortImUsd,
     capital.perpLongImUsd,
   ];
@@ -815,6 +894,7 @@ function buildPair(
     base: shortLeg.base === longLeg.base ? shortLeg.base : ctx.plan.underlying,
     shortLeg,
     longLeg,
+    borosLegs,
     grossSpreadApr,
     execSpreadApr,
     borosImpactApr,
@@ -889,6 +969,9 @@ export function buildOpportunities(
     }
 
     const builds = plan.markets.map((m) => buildMarketRow(m, input, options, collateralPriceUsd));
+    const spreadBuilds = plan.spreads
+      .filter((m) => m.state === 'Normal')
+      .map((m) => buildMarketRow(m, input, options, collateralPriceUsd));
     for (const build of builds) {
       if (!build.row.crossexVenue) {
         groupWarnings.push(
@@ -913,8 +996,35 @@ export function buildOpportunities(
         const b = tradable[j];
         if (directionApr(a, options) <= directionApr(b, options)) continue;
         if (a.row.crossexVenue === b.row.crossexVenue) continue;
-        pairs.push(buildPair(ctx, a, b, input, options));
+        const venues = [a.row.crossexVenue, b.row.crossexVenue];
+        // A tradable spread replaces the two singles, even with an empty book.
+        // A paused or close-only one cannot open, so the singles stand.
+        if (plan.spreads.some((m) => m.state === 'Normal' && m.spreadVenues?.every((v) => venues.includes(v)))) continue;
+        const boros: BorosLegBuild[] = [
+          { build: a, side: 'SHORT' },
+          { build: b, side: 'LONG' },
+        ];
+        pairs.push(buildPair(ctx, toLeg(a), toLeg(b), boros, input, options));
       }
+    }
+    for (const build of spreadBuilds) {
+      const venues = build.market.spreadVenues;
+      const rate = directionApr(build, options);
+      if (!venues || !venues.every((v) => input.crossexVenues.has(v))) continue;
+      // A spread at exactly 0 is still the pair's one route (the singles were
+      // skipped for it), so it keeps the first-venue-short side, not no side.
+      const side: SpreadSide = rate >= 0 ? 'SHORT' : 'LONG';
+      const [shortVenue, longVenue] = side === 'SHORT' ? venues : [venues[1], venues[0]];
+      const shortLeg = spreadPerpLeg(shortVenue, build, input);
+      const longLeg = spreadPerpLeg(longVenue, build, input);
+      for (const leg of [shortLeg, longLeg]) {
+        if (!leg.crossexSymbol) {
+          groupWarnings.push(
+            `No live CrossEx ${leg.crossexVenue} symbol for ${leg.base} — ${build.row.name} can't carry a hedge leg here.`,
+          );
+        }
+      }
+      pairs.push(buildPair(ctx, shortLeg, longLeg, [{ build, side }], input, options));
     }
     pairs.sort(
       (x, y) =>

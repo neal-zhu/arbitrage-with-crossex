@@ -47,6 +47,7 @@ const perp = (over: Partial<AssetPerpOpen>): AssetPerpOpen => ({
 const boros = (over: Partial<AssetBorosOpen>): AssetBorosOpen => ({
   marketId: 155,
   venue: 'HYPERLIQUID',
+  spreadVenues: null,
   maturity: NOW + 60 * DAY,
   collateral: 'ETH',
   side: 'LONG',
@@ -108,7 +109,7 @@ describe('hedge status', () => {
     expect(d.perfect).toBe(false);
   });
 
-  it('a partially-covered venue reports only the shortfall; within 2% counts as covered', () => {
+  it('a partially-covered venue reports only the shortfall; within 0.1% counts as covered on ETH', () => {
     const g = group({
       perpOpen: [perp({ symbol: 'HL', venue: 'HYPERLIQUID', side: 'LONG', qty: 1000 })],
       borosOpen: [boros({ marketId: 1, venue: 'HYPERLIQUID', side: 'LONG', sizeToken: 900 })],
@@ -120,9 +121,86 @@ describe('hedge status', () => {
 
     const near = group({
       perpOpen: [perp({ symbol: 'HL', venue: 'HYPERLIQUID', side: 'LONG', qty: 1000 })],
-      borosOpen: [boros({ marketId: 1, venue: 'HYPERLIQUID', side: 'LONG', sizeToken: 995 })],
+      borosOpen: [boros({ marketId: 1, venue: 'HYPERLIQUID', side: 'LONG', sizeToken: 999.5 })],
     });
     expect(deriveAsset(near, {}, 0, NOW).gaps).toHaveLength(0);
+  });
+
+  it('ETH on a coin market flags a 0.5% gap but keeps its locked APR, which holds to 2%', () => {
+    const g = group({
+      perpOpen: [
+        perp({ symbol: 'HL', venue: 'HYPERLIQUID', side: 'LONG', qty: 1000 }),
+        perp({ symbol: 'OKX', venue: 'OKX', side: 'SHORT', qty: 1000 }),
+      ],
+      borosOpen: [
+        boros({ marketId: 1, venue: 'HYPERLIQUID', side: 'LONG', sizeToken: 995 }),
+        boros({ marketId: 2, venue: 'OKX', side: 'SHORT', sizeToken: 1000 }),
+      ],
+    });
+    const d = deriveAsset(g, {}, 0, NOW);
+    expect(d.gaps).toMatchObject([{ venue: 'HYPERLIQUID', action: 'long-boros', size: 5, unit: 'base' }]);
+    expect(d.perfect).toBe(false);
+    expect(d.lockedCarryPerYearUsd).not.toBeNull();
+  });
+
+  it('a 3% ETH gap loses the locked APR as before', () => {
+    const g = group({
+      perpOpen: [
+        perp({ symbol: 'HL', venue: 'HYPERLIQUID', side: 'LONG', qty: 1000 }),
+        perp({ symbol: 'OKX', venue: 'OKX', side: 'SHORT', qty: 1000 }),
+      ],
+      borosOpen: [
+        boros({ marketId: 1, venue: 'HYPERLIQUID', side: 'LONG', sizeToken: 970 }),
+        boros({ marketId: 2, venue: 'OKX', side: 'SHORT', sizeToken: 1000 }),
+      ],
+    });
+    expect(deriveAsset(g, {}, 0, NOW).lockedCarryPerYearUsd).toBeNull();
+  });
+
+  it('ETH hedged on a USDT market keeps the 2% band, since its dollar size moves with price', () => {
+    const g = group({
+      perpOpen: [perp({ symbol: 'HL', venue: 'HYPERLIQUID', side: 'LONG', qty: 1000 })],
+      borosOpen: [
+        boros({ marketId: 1, venue: 'HYPERLIQUID', side: 'LONG', collateral: 'USDT', sizeToken: 1_890_500, notionalUsd: 1_890_500 }),
+      ],
+    });
+    expect(deriveAsset(g, {}, 0, NOW).gaps).toHaveLength(0);
+  });
+
+  it('HYPE keeps the 2% band on both checks', () => {
+    const g = group({
+      base: 'HYPE',
+      priceUsd: 85.75,
+      perpOpen: [
+        perp({ symbol: 'HL', venue: 'HYPERLIQUID', side: 'SHORT', qty: 2.3, notionalUsd: 197.23 }),
+        perp({ symbol: 'GATE', venue: 'GATE', side: 'LONG', qty: 2.3, notionalUsd: 199.0 }),
+      ],
+      borosOpen: [
+        boros({ marketId: 216, venue: 'HYPERLIQUID', side: 'SHORT', collateral: 'USDT', sizeToken: 200, notionalUsd: 200 }),
+        boros({ marketId: 217, venue: 'GATE', side: 'LONG', collateral: 'USDT', sizeToken: 200, notionalUsd: 200 }),
+      ],
+    });
+    const d = deriveAsset(g, {}, 0, NOW);
+    expect(d.gaps).toHaveLength(0);
+    expect(d.deltaNeutral).toBe(true);
+    expect(d.perfect).toBe(true);
+  });
+
+  it('ETH perps 0.5% apart are not delta-neutral', () => {
+    const g = group({
+      perpOpen: [
+        perp({ symbol: 'HL', venue: 'HYPERLIQUID', side: 'LONG', qty: 1000 }),
+        perp({ symbol: 'OKX', venue: 'OKX', side: 'SHORT', qty: 990 }),
+      ],
+      borosOpen: [
+        boros({ marketId: 1, venue: 'HYPERLIQUID', side: 'LONG', sizeToken: 1000 }),
+        boros({ marketId: 2, venue: 'OKX', side: 'SHORT', sizeToken: 990 }),
+      ],
+    });
+    const d = deriveAsset(g, {}, 0, NOW);
+    expect(d.deltaNeutral).toBe(false);
+    expect(d.perfect).toBe(false);
+    expect(d.lockedCarryPerYearUsd).not.toBeNull();
   });
 
   it('an unbalanced perp book is flagged even when every floating leg is covered', () => {
@@ -275,8 +353,8 @@ describe('exclusions', () => {
   it("'all' on a market also drops its history rows; partial does not", () => {
     const base = group({
       borosHistory: [
-        { marketId: 1, venue: 'HYPERLIQUID', maturity: NOW + DAY, settleUsd: 100, settleFeeUsd: 2, tradePnlUsd: -10, tradeFeeUsd: 10 },
-        { marketId: 2, venue: 'OKX', maturity: NOW + DAY, settleUsd: 40, settleFeeUsd: 1, tradePnlUsd: 0, tradeFeeUsd: 0 },
+        { marketId: 1, venue: 'HYPERLIQUID', spreadVenues: null, maturity: NOW + DAY, settleUsd: 100, settleFeeUsd: 2, tradePnlUsd: -10, tradeFeeUsd: 10 },
+        { marketId: 2, venue: 'OKX', spreadVenues: null, maturity: NOW + DAY, settleUsd: 40, settleFeeUsd: 1, tradePnlUsd: 0, tradeFeeUsd: 0 },
       ],
       perpClosed: [
         { symbol: 'GATE_OLD', venue: 'GATE', closedPnlUsd: 20, fundingUsd: 5, feesUsd: 3, count: 1, lastClosedAt: NOW - DAY, rows: [] },
@@ -308,7 +386,7 @@ describe('carry − cost', () => {
         { symbol: 'GATE_OLD', venue: 'GATE', closedPnlUsd: -25, fundingUsd: 80, feesUsd: 15, count: 1, lastClosedAt: NOW - DAY, rows: [] },
       ],
       borosHistory: [
-        { marketId: 1, venue: 'HYPERLIQUID', maturity: NOW + DAY, settleUsd: 500, settleFeeUsd: 12, tradePnlUsd: -30, tradeFeeUsd: 8 },
+        { marketId: 1, venue: 'HYPERLIQUID', spreadVenues: null, maturity: NOW + DAY, settleUsd: 500, settleFeeUsd: 12, tradePnlUsd: -30, tradeFeeUsd: 8 },
       ],
     });
     const d = deriveAsset(g, {}, 0, NOW);
@@ -327,8 +405,8 @@ describe('carry − cost', () => {
     const g = group({
       perpOpen: [perp({ symbol: 'HL', venue: 'HYPERLIQUID', side: 'LONG', qty: 1000, upnlUsd: 0, fundingUsd: 0, feesUsd: 0 })],
       borosHistory: [
-        { marketId: 1, venue: 'HYPERLIQUID', maturity: NOW + DAY, settleUsd: 500, settleFeeUsd: 12, rebateUsd: 6, tradePnlUsd: 0, tradeFeeUsd: 0 },
-        { marketId: 2, venue: 'OKX', maturity: NOW + DAY, settleUsd: 40, settleFeeUsd: 4, rebateUsd: 2, tradePnlUsd: 0, tradeFeeUsd: 0 },
+        { marketId: 1, venue: 'HYPERLIQUID', spreadVenues: null, maturity: NOW + DAY, settleUsd: 500, settleFeeUsd: 12, rebateUsd: 6, tradePnlUsd: 0, tradeFeeUsd: 0 },
+        { marketId: 2, venue: 'OKX', spreadVenues: null, maturity: NOW + DAY, settleUsd: 40, settleFeeUsd: 4, rebateUsd: 2, tradePnlUsd: 0, tradeFeeUsd: 0 },
       ],
     });
     const d = deriveAsset(g, {}, 0, NOW);
@@ -347,7 +425,7 @@ describe('carry − cost', () => {
     const plain = deriveAsset(
       group({
         perpOpen: [perp({ symbol: 'HL', venue: 'HYPERLIQUID', side: 'LONG', qty: 1000, upnlUsd: 0, fundingUsd: 0, feesUsd: 0 })],
-        borosHistory: [{ marketId: 1, venue: 'HYPERLIQUID', maturity: NOW + DAY, settleUsd: 500, settleFeeUsd: 12, tradePnlUsd: 0, tradeFeeUsd: 0 }],
+        borosHistory: [{ marketId: 1, venue: 'HYPERLIQUID', spreadVenues: null, maturity: NOW + DAY, settleUsd: 500, settleFeeUsd: 12, tradePnlUsd: 0, tradeFeeUsd: 0 }],
       }),
       {},
       0,
@@ -369,7 +447,7 @@ describe('totals & APR', () => {
         boros({ marketId: 1, settleUsd: 3205, mtmUsd: 820, imUsd: 500 }),
       ],
       borosHistory: [
-        { marketId: 1, venue: 'HYPERLIQUID', maturity: NOW + DAY, settleUsd: 3205, settleFeeUsd: 30, tradePnlUsd: -390, tradeFeeUsd: 390 },
+        { marketId: 1, venue: 'HYPERLIQUID', spreadVenues: null, maturity: NOW + DAY, settleUsd: 3205, settleFeeUsd: 30, tradePnlUsd: -390, tradeFeeUsd: 390 },
       ],
       perpClosed: [
         { symbol: 'OLD', venue: 'GATE', closedPnlUsd: 150, fundingUsd: 30, feesUsd: 12, count: 1, lastClosedAt: NOW - DAY, rows: [] },
@@ -595,7 +673,7 @@ describe('exclusions and maturity — his 2026-09-09 rules', () => {
       perpOpen: [perp({ symbol: 'HL', venue: 'HYPERLIQUID', side: 'LONG', qty: 1000, imUsd: 10_000 })],
       borosOpen: [boros({ marketId: 1, venue: 'HYPERLIQUID', side: 'LONG', sizeToken: 1000, imUsd: 10_000, mtmUsd: 900 })],
       borosHistory: [
-        { marketId: 1, venue: 'HYPERLIQUID', maturity: NOW + 60 * DAY, settleUsd: 3000, settleFeeUsd: 30, tradePnlUsd: -10, tradeFeeUsd: 10 },
+        { marketId: 1, venue: 'HYPERLIQUID', spreadVenues: null, maturity: NOW + 60 * DAY, settleUsd: 3000, settleFeeUsd: 30, tradePnlUsd: -10, tradeFeeUsd: 10 },
       ],
     });
     const whole = deriveAsset(g, {}, 0, NOW);
@@ -745,6 +823,26 @@ describe('perpOnlyPairs', () => {
     expect(perpOnlyPairs([perpLeg('GATE', 'LONG', 10), perpLeg('OKX', 'LONG', 10)], []).pairs).toEqual([]);
     expect(perpOnlyPairs([perpLeg('GATE', 'LONG', 10), perpLeg('GATE', 'SHORT', 10)], []).pairs).toEqual([]);
   });
+
+  it('float residue is not a missing leg', () => {
+    // A Gate single of 0.949 − 0.158 behind 0.791 perps: 1e-16 short, not "missing <0.000001 ETH".
+    const [p] = perpOnlyPairs(
+      [perpLeg('GATE', 'LONG', 0.791), perpLeg('HYPERLIQUID', 'SHORT', 0.791)],
+      [yuLeg('GATE', 'LONG', 0.949 - 0.158, 1_790_000_000)],
+    ).pairs;
+    expect(p.missingLong).toBe(0);
+    expect(p.missingShort).toBe(0.791);
+  });
+
+  it('float residue on a dollar-unit leg of millions is not missing either', () => {
+    const usd = (l: ReturnType<typeof perpLeg>, n: number) => ({ ...l, unit: 'usd' as const, notionalUsd: n });
+    const take = 9_876_543.21;
+    const [p] = perpOnlyPairs(
+      [usd(perpLeg('GATE', 'LONG', 1), take), usd(perpLeg('HYPERLIQUID', 'SHORT', 1), take)],
+      [{ ...yuLeg('GATE', 'LONG', 1, 1_790_000_000), unit: 'usd' as const, notionalUsd: take - take * 2 ** -51 }],
+    ).pairs;
+    expect(p.missingLong).toBe(0);
+  });
 });
 
 describe('pairLockedSpread — on the RATE legs’ notional', () => {
@@ -818,7 +916,7 @@ describe('borosOnlyPairs', () => {
     expect(p.missingShort).toBeCloseTo(37.3, 9);
     expect(p.lockedSpread).toBeCloseTo(0.0266, 9);
     // The slice keeps its share of the venue leg, so a close stays capped.
-    expect(p.longYu.share).toBeCloseTo(0.0734, 9);
+    expect(p.longYu?.share).toBeCloseTo(0.0734, 9);
     expect(restPerps).toEqual([]);
     expect(restYus).toEqual([]);
   });
@@ -847,6 +945,37 @@ describe('borosOnlyPairs', () => {
     expect(restYus).toHaveLength(1);
     expect(restYus[0].venue).toBe('GATE');
     expect(restYus[0].sizeBase).toBe(60);
+  });
+
+  it('matches the closest sizes first: a remainder pair is not split by a larger book', () => {
+    // mozzarella 2026-10-14, rule 3: the Gate/Hyperliquid singles' unhedged
+    // 0.261 stays one unit although a 233 ETH Binance long shares the date.
+    const { pairs } = borosOnlyPairs(
+      [],
+      [
+        yuLeg('BINANCE', 'LONG', 233, M, -0.06, 1),
+        yuLeg('LIGHTER', 'SHORT', 191.6, M, 0.049, 2),
+        yuLeg('GATE', 'LONG', 0.261, M, -0.062, 3),
+        yuLeg('HYPERLIQUID', 'SHORT', 0.261, M, 0.154, 4),
+      ],
+    );
+    expect(pairs.map((p) => `${p.longVenue}/${p.shortVenue} ${p.size}`).sort()).toEqual(['BINANCE/LIGHTER 191.6', 'GATE/HYPERLIQUID 0.261']);
+  });
+
+  it('keeps largest first when closest first would strand a venue that holds both sides', () => {
+    // After an open-only roll: Gate L 5 with HL S 5.1 (a part-fill), HL L 5
+    // with Lighter S 5. Closest first pairs only Gate/Lighter and strands both
+    // HL legs; largest first pairs all 10.
+    const { pairs } = borosOnlyPairs(
+      [],
+      [
+        yuLeg('GATE', 'LONG', 5, M, -0.05, 1),
+        yuLeg('HYPERLIQUID', 'SHORT', 5.1, M, 0.08, 2),
+        yuLeg('HYPERLIQUID', 'LONG', 5, M, -0.05, 3),
+        yuLeg('LIGHTER', 'SHORT', 5, M, 0.08, 4),
+      ],
+    );
+    expect(pairs.map((p) => `${p.longVenue}/${p.shortVenue} ${p.size}`).sort()).toEqual(['GATE/HYPERLIQUID 5', 'HYPERLIQUID/LIGHTER 5']);
   });
 
   it('never blends maturities, pairs a venue with itself, or pairs two legs on one side', () => {
