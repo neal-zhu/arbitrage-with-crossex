@@ -16,9 +16,11 @@
  */
 import { BOROS_NETWORK } from '../../../web/src/lib/borosNetwork';
 import { prettyVenue } from '../../../web/src/lib/fmt';
+import { spreadName, spreadPlatform } from '../../../web/src/lib/spread';
 import { CoreError } from '../errors';
 import { BOOK_VENUES } from '../estimate/books';
 import { borosInitialMarginUsd } from './opportunities';
+import { parseSpreadVenues } from './spread';
 import { normalizeVenue } from './venue';
 
 /** The api-gateway surface (`/apis` → api-gateway → open-api's `open-api-v2/…`
@@ -111,11 +113,12 @@ export interface BorosMarket {
   takerFeeRate: number;
   /**
    * The venue's own cap on how far a trade may move the rate, as an APR
-   * fraction: `config.maxRateDeviationFactorBase1e4 / 1e4 × markApr`.
+   * fraction: `factor / 1e4 × max(floor, |markApr|)`, the floor being the IM
+   * rate floor (pendle-core-v3 `MarketOrderAndOtc.sol:135`, the same on every
+   * market; the Boros app's `getMaxRateDeviation` matches it).
    *
    * The factor is a FRACTION OF THE MARK, not the deviation itself — 2500 on a
-   * 6.57% market is 0.25 × 0.0657 = 1.64% APR, which is what the venue UI shows
-   * as "max rate deviation". A close bound wider than this can never fill, so
+   * 12% market is 0.25 × 0.12 = 3% APR. A close bound wider than this can never fill, so
    * half of it is the natural default slippage.
    */
   maxRateDeviationApr: number;
@@ -151,6 +154,7 @@ export interface BorosMarket {
    * another bucket's).
    */
   isolatedOnly?: boolean;
+  spreadVenues: [string, string] | null;
 }
 
 /** Boros books are quoted in whole APR ticks of this size (apr = tick × 0.0001). */
@@ -362,7 +366,7 @@ export async function fetchBorosMarkets(fetchImpl: FetchLike): Promise<BorosMark
     if (resumeToken === null || added.length === 0) break;
   }
   const nowSec = Date.now() / 1000;
-  return out.map((m) => normalizeBorosMarket(m, nowSec));
+  return out.filter((m) => !isUnreadableSpread(m)).map((m) => normalizeBorosMarket(m, nowSec));
 }
 
 /**
@@ -386,6 +390,12 @@ export async function fetchBorosMarket(fetchImpl: FetchLike, marketId: number): 
 
 const MARKET_STATUS: Record<number, string> = { 0: 'Paused', 1: 'CloseOnly', 2: 'Normal' };
 
+function isUnreadableSpread(m: Record<string, unknown>): boolean {
+  const metadata = (m.metadata ?? {}) as Record<string, unknown>;
+  const platform = (m.platform ?? {}) as Record<string, unknown>;
+  return metadata.isSpreadMarket === true && parseSpreadVenues(true, String(platform.platformId ?? '')) === null;
+}
+
 function normalizeBorosMarket(m: Record<string, unknown>, nowSec: number): BorosMarket {
   const imData = (m.imData ?? {}) as Record<string, unknown>;
   const maturity = Number(imData.maturity ?? 0);
@@ -396,24 +406,42 @@ function normalizeBorosMarket(m: Record<string, unknown>, nowSec: number): Boros
     const platform = (m.platform ?? {}) as Record<string, unknown>;
     const platformId = String(platform.platformId ?? '');
     const venueKey = normalizeVenue(platformId);
+    const spreadVenues = parseSpreadVenues(metadata.isSpreadMarket === true, platformId);
+    const venue = BOOK_VENUES.has(venueKey) ? prettyVenue(venueKey) : platformId;
+    const base = String(metadata.underlyingSymbol ?? '');
+    const due = new Date(maturity * 1000);
     return {
       marketId: Number(m.marketId),
       tokenId: Number(m.tokenId),
-      name: String(imData.name ?? ''),
-      venue: BOOK_VENUES.has(venueKey) ? prettyVenue(venueKey) : platformId,
-      base: String(metadata.underlyingSymbol ?? ''),
+      name: spreadVenues
+        ? `${spreadName(base, spreadVenues)} ${due.getUTCDate()} ${due.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' })} ${due.getUTCFullYear()}`
+        : String(imData.name ?? ''),
+      venue: spreadVenues ? spreadPlatform(spreadVenues) : venue,
+      base,
       maturity,
       paymentPeriod: Number(extConfig.paymentPeriod ?? 0),
       settleFeeApr: norm18(extConfig.settleFeeRate as string),
       markApr: Number(data.markApr ?? 0),
       floatingApr: Number(data.floatingApr ?? 0),
-      midApr: Number(data.midApr ?? 0),
+      // A spread trades around 0, so its 0 is a real level (see knownRateOf);
+      // one with no mid falls back to its mark rather than to a false 0.
+      midApr: Number(data.midApr ?? (spreadVenues ? data.markApr : undefined) ?? 0),
       notionalOi: Number(data.notionalOI ?? 0),
       takerFeeRate: norm18(config.takerFee as string),
       maxRateDeviationApr:
-        (Number(config.maxRateDeviationFactorBase1e4 ?? 0) / 1e4) * Number(data.markApr ?? 0),
+        (Number(config.maxRateDeviationFactorBase1e4 ?? 0) / 1e4) *
+        Math.max(
+          1.00005 ** (Number(imData.iTickThresh ?? 0) * Number(imData.tickStep ?? 0)) - 1,
+          Math.abs(Number(data.markApr ?? 0)),
+        ),
+      // A spread Boros still lists as a dev test (isUiWhitelisted false, so not
+      // in the Boros app) takes no opens here either; a held one still closes.
       state:
-        maturity > 0 && maturity <= nowSec ? 'Matured' : (MARKET_STATUS[Number(config.status)] ?? 'Unknown'),
+        maturity > 0 && maturity <= nowSec
+          ? 'Matured'
+          : spreadVenues && metadata.isUiWhitelisted === false && Number(config.status) === 2
+            ? 'CloseOnly'
+            : (MARKET_STATUS[Number(config.status)] ?? 'Unknown'),
       assetMarkPriceUsd: Number(data.assetMarkPrice ?? 0),
       kIM: norm18(config.kIM as string),
       kMM: norm18(config.kMM as string),
@@ -421,6 +449,7 @@ function normalizeBorosMarket(m: Record<string, unknown>, nowSec: number): Boros
       imTickStep: Number(imData.tickStep ?? 0),
       tThreshSec: Number(config.tThresh ?? 0),
       isolatedOnly: imData.isIsolatedOnly === true,
+      spreadVenues,
   };
 }
 
@@ -760,7 +789,8 @@ export function resolveCollateralPricesUsd(markets: BorosMarket[]): Map<number, 
       prices.set(tokenId, 1);
       continue;
     }
-    const ref = markets.find((m) => m.base === symbol && m.assetMarkPriceUsd > 0);
+    const priced = markets.filter((m) => m.base === symbol && m.assetMarkPriceUsd > 0);
+    const ref = priced.find((m) => m.spreadVenues === null) ?? priced[0];
     prices.set(tokenId, ref ? ref.assetMarkPriceUsd : null);
   }
   return prices;
